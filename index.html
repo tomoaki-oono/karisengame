@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>モグラの冒険 (ドラゴン高さランダム & 最高到達ステージ表示 & バグ修正)</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #fafafa;
+      font-family: sans-serif;
+    }
+    #gameCanvas {
+      display: block;
+      margin: 20px auto;
+      border: 2px solid #333;
+      background: #ade; /* 空の色 */
+    }
+    #info {
+      width: 800px;
+      margin: 0 auto;
+      text-align: center;
+      padding: 10px;
+      background: #fff;
+      border: 1px solid #ccc;
+    }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="400"></canvas>
+<div id="info">
+  <p><strong>操作方法：</strong>←→ で移動、↑ または スペースキーでジャンプ</p>
+  <p>・10秒ごとにステージが1つ進み、敵の同時出現数が増えます</p>
+  <p>・ドラゴンはランダムな高さから出現</p>
+  <p>・倒したときのスコアはステージ数を掛け算(高さ補正もあり)</p>
+  <p>・火の玉、または敵に横/下から衝突するとゲームオーバー</p>
+  <p>・ゲームオーバー後はスペースキーを押して再スタート</p>
+</div>
+
+<script>
+// -----------------------------
+// 画像読み込み
+// -----------------------------
+const imgMole   = new Image(); imgMole.src   = 'mole.png';
+const imgDragon = new Image(); imgDragon.src = 'dragon.png';
+const imgBird   = new Image(); imgBird.src   = 'bird.png';
+const imgGiant  = new Image(); imgGiant.src  = 'giant.png';
+
+// -----------------------------
+// ゲーム全体設定
+// -----------------------------
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const WIDTH  = canvas.width;
+const HEIGHT = canvas.height;
+
+const FLOOR = 360;      // 地面のY座標
+const GRAVITY = 0.4;    // 重力
+const JUMP_POWER = 10;  // ジャンプ力
+const MOVE_SPEED = 3;   // 左右移動速度
+const FPS = 60;         // 60fps
+// 10秒ごとにステージが1つ上がる -> 同時出現最大数を増加
+const WAVE_INTERVAL = 600; // 600フレーム=10秒 (60fps想定)
+
+// ゲーム状態
+let gameOver = false;
+
+// スコア・ハイスコア・最高到達ステージ
+let score = 0;
+let highScore = 0;
+let hiStage = 1;  // ゲーム通算で到達した最高ステージ
+
+// 経過フレーム
+let frameCount = 0;
+
+// 敵リスト
+let enemies = [];
+// 火の玉リスト
+let fireBalls = [];
+
+// プレイヤー(モグラ)
+let player = {
+  x:  100,
+  y:  FLOOR - 40,
+  width:  40,
+  height: 40,
+  vx: 0,
+  vy: 0,
+  isOnGround: false,
+};
+
+// 足場(プラットフォーム)を4つ配置
+//   - baseY, amplitude, moving を指定することで上下動
+let platforms = [
+  // 左の可動足場 (上下に動く)
+  { x: 80,  y: 300, width: 80, height: 20,
+    baseY: 300, amplitude: 40, moving: true },
+  // 右側にも既存で3つ
+  { x: 250, y: 300, width: 80, height: 20,
+    baseY: 300, amplitude: 0,   moving: false },
+  { x: 450, y: 260, width: 80, height: 20,
+    baseY: 260, amplitude: 0,   moving: false },
+  { x: 650, y: 220, width: 80, height: 20,
+    baseY: 220, amplitude: 0,   moving: false },
+];
+
+// キー入力
+let leftPressed  = false;
+let rightPressed = false;
+let jumpPressed  = false;
+
+// ----------------------------------------------------------
+// 敵の種類定義 (ランダム生成用)
+// ----------------------------------------------------------
+const enemyTypes = [
+  {
+    type: 'dragon',
+    width: 50,
+    height: 50,
+    image: imgDragon,
+    speedX: -2,
+  },
+  {
+    type: 'bird',
+    width: 40,
+    height: 40,
+    image: imgBird,
+    speedX: -3,
+  },
+  {
+    type: 'giant',
+    width: 60,
+    height: 120,
+    image: imgGiant,
+    speedX: -1.5,
+  },
+];
+
+// ----------------------------------------------------------
+// 初期化
+// ----------------------------------------------------------
+function initGame() {
+  player.x = 100;
+  player.y = FLOOR - 40;
+  player.vx = 0;
+  player.vy = 0;
+  player.isOnGround = false;
+
+  score = 0;
+  frameCount = 0;
+  gameOver = false;
+
+  enemies = [];
+  fireBalls = [];
+}
+
+// ----------------------------------------------------------
+// 敵を1体生成
+//  (ドラゴンだけは Y座標をランダムにしている)
+// ----------------------------------------------------------
+function spawnEnemy() {
+  const base = enemyTypes[Math.floor(Math.random() * enemyTypes.length)];
+  const enemy = {
+    type: base.type,
+    width:  base.width,
+    height: base.height,
+    image:  base.image,
+    x: WIDTH + 50 + Math.random() * 200, // 画面右外の適当な位置
+    y: 0,
+    vx: base.speedX,
+    vy: 0,
+    isAlive: true,
+  };
+
+  // ランダムなY位置など
+  if (enemy.type === 'giant') {
+    // 巨人は地面に合わせる
+    enemy.y = FLOOR - enemy.height;
+  } else if (enemy.type === 'dragon') {
+    // ドラゴンの高さをランダムに
+    // 画面上〜床の範囲だと極端なので、適度な範囲を設定
+    const minY = 80; // 上に行きすぎないように
+    const maxY = FLOOR - enemy.height - 20; // 地面ギリギリまで
+    enemy.y = Math.random() * (maxY - minY) + minY;
+  } else if (enemy.type === 'bird') {
+    // 鳥はそこそこ空中固定(上下ゆらゆら動く)
+    enemy.y = 180 + Math.random() * 40;
+  }
+
+  enemies.push(enemy);
+}
+
+// ----------------------------------------------------------
+// ドラゴンが火を吐く
+// ----------------------------------------------------------
+function shootFire(dragon) {
+  const size = 20;
+  const fx = dragon.x;
+  const fy = dragon.y + dragon.height / 2 - size/2;
+
+  fireBalls.push({
+    x: fx,
+    y: fy,
+    width:  size,
+    height: size,
+    vx: -5,
+    color: 'orange',
+  });
+}
+
+// ----------------------------------------------------------
+// スコア加算 (ハイスコア更新も)
+// ----------------------------------------------------------
+function addScore(value) {
+  score += value;
+  if (score > highScore) {
+    highScore = score;
+  }
+}
+
+// ----------------------------------------------------------
+// 毎フレーム更新
+//   (足場でのジャンプがしづらい問題を軽減するため
+//    順序を整理して着地後にジャンプ判定するように修正)
+// ----------------------------------------------------------
+function update() {
+  frameCount++;
+
+  // ------------------------
+  // wave & hiStage更新
+  // ------------------------
+  // 10秒(600フレーム)ごとにステージ(wave)が増加
+  const wave = 1 + Math.floor(frameCount / WAVE_INTERVAL);
+  if (wave > hiStage) {
+    hiStage = wave; // 到達ステージの最大値を更新
+  }
+
+  // ------------------------
+  // 同時出現する敵数を wave に合わせる
+  // ------------------------
+  while (enemies.filter(e => e.isAlive).length < wave) {
+    spawnEnemy();
+  }
+
+  // ------------------------
+  // 横方向の入力
+  // ------------------------
+  if (leftPressed) {
+    player.vx = -MOVE_SPEED;
+  } else if (rightPressed) {
+    player.vx = MOVE_SPEED;
+  } else {
+    player.vx = 0;
+  }
+
+  // ------------------------
+  // 垂直方向: 重力
+  // ------------------------
+  player.vy += GRAVITY;
+
+  // ------------------------
+  // 実際に移動させる
+  // ------------------------
+  player.x += player.vx;
+  player.y += player.vy;
+
+  // ------------------------
+  // 地面との衝突
+  // ------------------------
+  if (player.y + player.height > FLOOR) {
+    player.y = FLOOR - player.height;
+    player.vy = 0;
+    player.isOnGround = true;
+  } else {
+    // 一度離れていれば false にしておく（後ほど足場判定で上書きする）
+    player.isOnGround = false;
+  }
+
+  // ------------------------
+  // 足場(プラットフォーム)の上下動
+  // ------------------------
+  platforms.forEach(p => {
+    if (p.moving && p.amplitude > 0) {
+      // 上下に動く
+      const offset = p.amplitude * Math.sin(frameCount / 60);
+      p.y = p.baseY + offset;
+    }
+  });
+
+  // ------------------------
+  // 足場との衝突(落下中のみ簡易)
+  // ------------------------
+  if (player.vy >= 0) { // 下方向に動いている時のみ
+    platforms.forEach(p => {
+      // プレイヤーの下辺が足場の上面を越えるかチェック
+      const playerBottomNext = player.y + player.height; 
+      const isAbove = (playerBottomNext <= p.y + 5);  // 少し余裕をみる
+      // X範囲の重なり
+      const isOverlapX = (player.x + player.width > p.x) && (player.x < p.x + p.width);
+
+      if (isAbove && isOverlapX) {
+        // もし次のフレームで足場を突き抜けそうなら着地
+        if (playerBottomNext >= p.y && playerBottomNext <= p.y + 20) {
+          // 着地させる
+          player.y = p.y - player.height;
+          player.vy = 0;
+          player.isOnGround = true;
+        }
+      }
+    });
+  }
+
+  // ------------------------
+  // （バグ軽減）着地後にジャンプ可能にする
+  //   => 今フレームで着地したら、ここで jumpPressed をチェック
+  // ------------------------
+  if (jumpPressed && player.isOnGround) {
+    player.vy = -JUMP_POWER;
+    player.isOnGround = false;
+  }
+
+  // ------------------------
+  // 画面端(左右)で止める
+  // ------------------------
+  if (player.x < 0) {
+    player.x = 0;
+  }
+  if (player.x + player.width > WIDTH) {
+    player.x = WIDTH - player.width;
+  }
+
+  // ------------------------
+  // 敵の更新
+  // ------------------------
+  enemies.forEach(enemy => {
+    if (!enemy.isAlive) return;
+
+    enemy.x += enemy.vx;
+    enemy.y += enemy.vy;
+
+    // 鳥は上下にゆらゆら
+    if (enemy.type === 'bird') {
+      enemy.y += Math.sin(frameCount / 20) * 1;
+    }
+    // ドラゴンは一定間隔で火を吐く (例:2秒に1回)
+    if (enemy.type === 'dragon' && frameCount % 120 === 0) {
+      shootFire(enemy);
+    }
+
+    // 画面左外に消えたら isAlive = false
+    if (enemy.x + enemy.width < 0) {
+      enemy.isAlive = false;
+    }
+
+    // 衝突判定
+    if (isColliding(player, enemy)) {
+      // 踏んだかどうか
+      const playerBottom = player.y + player.height;
+      const enemyTop = enemy.y;
+      const stomped = (playerBottom - enemyTop < 15) && (player.vy > 0);
+
+      if (stomped) {
+        enemy.isAlive = false;
+        // 反動ジャンプ
+        player.vy = -JUMP_POWER / 2;
+
+        // 得点 (基礎100 + 高さ補正)× wave
+        const baseScore = 100 + Math.floor((HEIGHT - player.y) * 0.5);
+        const add = baseScore * wave;
+        addScore(add);
+
+      } else {
+        // 横or下から衝突 -> ゲームオーバー
+        gameOver = true;
+      }
+    }
+  });
+
+  // ------------------------
+  // 火の玉の更新
+  // ------------------------
+  fireBalls.forEach((fire, i) => {
+    fire.x += fire.vx;
+    if (fire.x + fire.width < 0) {
+      // 画面外に消えた
+      fireBalls.splice(i, 1);
+      return;
+    }
+    // 衝突
+    if (isColliding(player, fire)) {
+      gameOver = true;
+    }
+  });
+}
+
+// ----------------------------------------------------------
+// 描画
+// ----------------------------------------------------------
+function draw() {
+  ctx.clearRect(0, 0, WIDTH, HEIGHT);
+
+  // 地面
+  ctx.fillStyle = "green";
+  ctx.fillRect(0, FLOOR, WIDTH, HEIGHT - FLOOR);
+
+  // 足場
+  ctx.fillStyle = "#666";
+  platforms.forEach(p => {
+    ctx.fillRect(p.x, p.y, p.width, p.height);
+  });
+
+  // プレイヤー
+  ctx.drawImage(imgMole, player.x, player.y, player.width, player.height);
+
+  // 敵
+  enemies.forEach(enemy => {
+    if (!enemy.isAlive) return;
+    ctx.drawImage(enemy.image, enemy.x, enemy.y, enemy.width, enemy.height);
+  });
+
+  // 火の玉 (オレンジの丸)
+  fireBalls.forEach(fire => {
+    ctx.fillStyle = fire.color;
+    ctx.beginPath();
+    ctx.arc(
+      fire.x + fire.width/2,
+      fire.y + fire.height/2,
+      fire.width/2,
+      0, Math.PI * 2
+    );
+    ctx.fill();
+  });
+
+  // スコア表示 (左上)
+  ctx.fillStyle = "#000";
+  ctx.font = "18px sans-serif";
+  ctx.fillText(`Score: ${score}`, 20, 30);
+  ctx.fillText(`HighScore: ${highScore}`, 20, 60);
+
+  // 最高到達ステージを表示 (Scoreの下)
+  ctx.fillText(`HiStage: ${hiStage}`, 20, 90);
+
+  // 右上に経過時間と現在ステージ
+  const timeSec = Math.floor(frameCount / FPS);
+  const wave = 1 + Math.floor(frameCount / WAVE_INTERVAL);
+  const rightX = WIDTH - 160;
+  ctx.fillText(`Time: ${timeSec}s`, rightX, 30);
+  ctx.fillText(`Stage: ${wave}`, rightX, 60);
+}
+
+// ----------------------------------------------------------
+// 衝突判定(矩形同士)
+// ----------------------------------------------------------
+function isColliding(a, b) {
+  return (
+    a.x < b.x + b.width &&
+    a.x + a.width > b.x &&
+    a.y < b.y + b.height &&
+    a.y + a.height > b.y
+  );
+}
+
+// ----------------------------------------------------------
+// ゲームオーバー画面
+// ----------------------------------------------------------
+function drawGameOver() {
+  // 最終フレームを背景に残してオーバーレイ
+  draw();
+
+  ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  ctx.fillStyle = "#fff";
+  ctx.font = "48px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("GAME OVER", WIDTH / 2, HEIGHT / 2);
+
+  ctx.font = "24px sans-serif";
+  ctx.fillText("Press SPACE to Restart", WIDTH / 2, HEIGHT / 2 + 40);
+}
+
+// ----------------------------------------------------------
+// メインループ
+// ----------------------------------------------------------
+function gameLoop() {
+  if (!gameOver) {
+    update();
+    draw();
+  } else {
+    drawGameOver();
+  }
+}
+
+// ----------------------------------------------------------
+// リスタート
+// ----------------------------------------------------------
+function restartGame() {
+  initGame();
+}
+
+// ----------------------------------------------------------
+// キーボード入力
+// ----------------------------------------------------------
+window.addEventListener('keydown', (e) => {
+  switch(e.key) {
+    case 'ArrowLeft':
+      leftPressed = true;
+      break;
+    case 'ArrowRight':
+      rightPressed = true;
+      break;
+    case 'ArrowUp':
+    case ' ':
+      // ゲームオーバー中に押せば再スタート
+      if (gameOver) {
+        restartGame();
+      } else {
+        jumpPressed = true;
+      }
+      break;
+  }
+});
+window.addEventListener('keyup', (e) => {
+  switch(e.key) {
+    case 'ArrowLeft':
+      leftPressed = false;
+      break;
+    case 'ArrowRight':
+      rightPressed = false;
+      break;
+    case 'ArrowUp':
+    case ' ':
+      jumpPressed = false;
+      break;
+  }
+});
+
+// ----------------------------------------------------------
+// ゲーム開始
+// ----------------------------------------------------------
+initGame(); // 初期化
+setInterval(gameLoop, 1000 / FPS);
+</script>
+</body>
+</html>
